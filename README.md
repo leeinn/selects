@@ -160,6 +160,25 @@ configurable per-scope and library-wide percentile thresholds (see [Configuratio
 After upgrading to SigLIP 2, re-run `selects index <folder> --pass embed` (and `aesthetic`) so
 stored vectors match the new towers.
 
+## Photography editor / grading candidates
+
+The optional second-stage photography workflow uses a wider candidate pool and
+cached previews, keeping visual grading potential separate from machine aesthetic
+scores. It adds no vision model or database migration:
+
+```bash
+selects creative candidates /path/to/trip --percentile 50 --batch-size 50
+selects creative import /path/to/trip /path/to/trip/.selects/creative/batch_0001.json
+selects creative shortlist /path/to/trip --heroes 12 --grades 40 --story 80
+selects creative report /path/to/trip
+selects creative xmp /path/to/trip --dry-run
+```
+
+Grades includes heroes; story includes both. Reports live in `.selects/creative/`.
+XMP defaults to dry-run and applies only sidecars, preserving original image bytes.
+See the [CLI and review contract](docs/creative-curation.md) and
+[travel-photo-curator Skill](skills/travel-photo-curator/SKILL.md).
+
 ## Roadmap
 
 **Shipped (v0.1)**

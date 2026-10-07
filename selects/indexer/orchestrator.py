@@ -65,8 +65,10 @@ def index_folder(
 
     with session_scope(Session) as s:
         photo_by_path = {
-            path: (id_, sha)
-            for path, id_, sha in s.execute(select(Photo.path, Photo.id, Photo.sha256))
+            path: (id_, sha, thumb, preview)
+            for path, id_, sha, thumb, preview in s.execute(
+                select(Photo.path, Photo.id, Photo.sha256, Photo.thumb_path, Photo.preview_path)
+            )
         }
         video_by_path = {
             path: (id_, sha)
@@ -88,11 +90,13 @@ def index_folder(
                 video_by_path[key] = (video_id or 0, sha)
             else:
                 existing = photo_by_path.get(key)
-                if existing is not None and existing[1] == sha:
+                if existing is not None and existing[1] == sha and all(
+                    rel and (cfg.state_dir / rel).is_file() for rel in existing[2:]
+                ):
                     continue
                 photo_id = existing[0] if existing is not None else None
                 added += _ingest_photo(cfg, Session, path, sha, kind, photo_id=photo_id)
-                photo_by_path[key] = (photo_id or 0, sha)
+                photo_by_path[key] = (photo_id or 0, sha, f"thumbs/{sha}.jpg", f"previews/{sha}.jpg")
         except Exception as exc:
             failed += 1
             log.warning("Failed to ingest %s: %s", path, exc)

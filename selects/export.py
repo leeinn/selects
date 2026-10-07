@@ -35,6 +35,11 @@ VERDICT_RATING: dict[str, int] = {
     "liked": 5,
     "curated": 4,
     "rejected": 1,
+    "hero": 5,
+    "grade": 4,
+    "story": 3,
+    "maybe": 2,
+    "reject": 1,
 }
 
 
@@ -267,6 +272,15 @@ def _sidecar_path(path: Path) -> Path:
     return path.with_suffix(path.suffix + ".xmp")
 
 
+def rating_sidecar_path(path: Path) -> Path:
+    """Creative sidecar name: standard RAW stem, format-specific for other stills.
+
+    RAW+JPEG pairs commonly share a stem but can have different review decisions.
+    Preserve those separate ratings without writing into either original.
+    """
+    return path.with_suffix(".xmp") if classify(path) == FileKind.RAW else _sidecar_path(path)
+
+
 def _read_existing_rating(target: Path) -> Optional[int]:
     """Best-effort read of an existing Xmp.xmp.Rating, or None if absent/unreadable."""
     if not target.exists():
@@ -320,11 +334,16 @@ def plan_xmp_write(
     verdict: str,
     force: bool = False,
     library_root: Optional[Path] = None,
+    *,
+    sidecar_only: bool = False,
 ) -> XmpPlan:
     """Compute what would be written for one photo, without writing anything.
 
     Powers both the preview endpoint and the actual write (same logic decides
     whether to skip due to an existing higher rating).
+
+    ``sidecar_only=True`` uses ``stem.xmp`` for RAW and ``stem.ext.xmp`` for
+    other stills. The default keeps historical RAW/embedded JPEG behavior.
     """
     rating = VERDICT_RATING.get(verdict)
     if rating is None:
@@ -343,13 +362,27 @@ def plan_xmp_write(
 
     kind = classify(path)
     is_raw = kind == FileKind.RAW
-    target = _sidecar_path(path) if is_raw else path
+    is_sidecar = is_raw or sidecar_only
+    # Creative exports use the conventional stem.xmp name read by Lightroom.
+    # Existing callers retain their extension.xmp / embedded JPEG behavior.
+    target = rating_sidecar_path(path) if sidecar_only else (_sidecar_path(path) if is_raw else path)
+    if is_sidecar and (
+        target.is_symlink()
+        or (target.exists() and target.stat().st_nlink > 1)
+        or (library_root is not None and _outside_library(target, library_root))
+        or (sidecar_only and kind not in {FileKind.RAW, FileKind.JPEG, FileKind.HEIC})
+    ):
+        return XmpPlan(
+            photo_id=photo_id, path=str(path), verdict=verdict, new_rating=rating,
+            target=str(target), is_sidecar=True, existing_rating=None,
+            action="no_op", reason="unsafe sidecar target or unsupported photo format",
+        )
     existing = _read_existing_rating(target)
 
     if not path.exists() and not is_raw:
         return XmpPlan(
             photo_id=photo_id, path=str(path), verdict=verdict, new_rating=rating,
-            target=str(target), is_sidecar=is_raw, existing_rating=existing,
+            target=str(target), is_sidecar=is_sidecar, existing_rating=existing,
             action="no_op", reason="source file missing",
         )
     if is_raw and not path.exists():
@@ -363,19 +396,19 @@ def plan_xmp_write(
         if existing > rating:
             return XmpPlan(
                 photo_id=photo_id, path=str(path), verdict=verdict, new_rating=rating,
-                target=str(target), is_sidecar=is_raw, existing_rating=existing,
+                target=str(target), is_sidecar=is_sidecar, existing_rating=existing,
                 action="skip_lower",
             )
         if existing == rating:
             return XmpPlan(
                 photo_id=photo_id, path=str(path), verdict=verdict, new_rating=rating,
-                target=str(target), is_sidecar=is_raw, existing_rating=existing,
+                target=str(target), is_sidecar=is_sidecar, existing_rating=existing,
                 action="skip_same",
             )
 
     return XmpPlan(
         photo_id=photo_id, path=str(path), verdict=verdict, new_rating=rating,
-        target=str(target), is_sidecar=is_raw, existing_rating=existing,
+        target=str(target), is_sidecar=is_sidecar, existing_rating=existing,
         action="write",
     )
 
@@ -384,10 +417,13 @@ def preview_xmp_writes(
     photos: Iterable[tuple[int, Path, str]],
     force: bool = False,
     library_root: Optional[Path] = None,
+    *,
+    sidecar_only: bool = False,
 ) -> list[XmpPlan]:
-    """Dry-run: compute the write plan for each (photo_id, path, verdict)."""
+    """Dry-run: compute the write plan, optionally using only rating sidecars."""
     return [
-        plan_xmp_write(pid, path, verdict, force=force, library_root=library_root)
+        plan_xmp_write(pid, path, verdict, force=force, library_root=library_root,
+                       sidecar_only=sidecar_only)
         for pid, path, verdict in photos
     ]
 
@@ -396,16 +432,22 @@ def write_xmp_ratings(
     photos: Iterable[tuple[int, Path, str]],
     force: bool = False,
     library_root: Optional[Path] = None,
+    *,
+    sidecar_only: bool = False,
 ) -> list[XmpPlan]:
     """Actually write the ratings, returning the same plan shape with results applied.
 
     Plans with action ``skip_lower`` / ``skip_same`` / ``no_op`` are left as-is
     (nothing written). Plans with action ``write`` get the rating stamped via
     pyexiv2, creating a sidecar file for RAW sources.
+
+    With ``sidecar_only=True`` every still format uses a sidecar; original
+    image bytes are never modified. Existing sidecar metadata is preserved.
     """
     results: list[XmpPlan] = []
     for pid, path, verdict in photos:
-        plan = plan_xmp_write(pid, path, verdict, force=force, library_root=library_root)
+        plan = plan_xmp_write(pid, path, verdict, force=force, library_root=library_root,
+                              sidecar_only=sidecar_only)
         if plan.action != "write":
             results.append(plan)
             continue
@@ -413,7 +455,8 @@ def write_xmp_ratings(
         target = Path(plan.target)
         try:
             if plan.is_sidecar and not target.exists():
-                target.write_text(_minimal_xmp_sidecar(plan.new_rating), encoding="utf-8")
+                with target.open("x", encoding="utf-8") as f:
+                    f.write(_minimal_xmp_sidecar(plan.new_rating))
             else:
                 import pyexiv2  # noqa: PLC0415
 
